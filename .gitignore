@@ -13,3 +13,4 @@ __pycache__/
 # Local acquisition recordings
 *.tdms
 *.tdms_index
+/PLAN_CYD.md
