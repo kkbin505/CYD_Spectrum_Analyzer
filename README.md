@@ -2,6 +2,9 @@
 
 本项目面向 ES3C28P  ES32-S3 触摸屏开发板：使用板载 ES8311 麦克风采集声音，实时显示频谱、滚动热力图和基于阶次估算的电机转速。
 
+<img width="320" height="240" alt="cyd_screen_02" src="https://github.com/user-attachments/assets/280a5927-62f8-4ac1-af7a-a08ea7d8c3ad" />
+
+
 https://www.lcdwiki.com/2.8inch_ESP32-S3_Display
 
 
