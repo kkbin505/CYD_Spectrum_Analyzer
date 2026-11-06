@@ -44,14 +44,17 @@ from pathlib import Path
 import numpy as np
 import pyfar as pf
 
+# Resolve bundled drivers relative to this script, independently of the working directory.
+_DRIVER_DIR = Path(__file__).resolve().parent
 SEARCH_DLL_PATHS = [
-    "../../BIN/x64/USB2406.dll",
-    "../../BIN/x64/usb2406.dll",
-    r"D:\LiZhen\Gentorque\usb2406_v3.0-main-新版\SDK\dll64\usb2406.dll",
-    r"D:\LiZhen\Gentorque\usb2406_v3.0-main-新版\Example\dev\BIN\x64\usb2406.dll",
+    _DRIVER_DIR / "USB2406.dll",
+    _DRIVER_DIR / "usb2406.dll",
+    _DRIVER_DIR.parent / "SDK" / "dll64" / "usb2406.dll",
+    _DRIVER_DIR / "../../BIN/x64/USB2406.dll",
+    _DRIVER_DIR / "../../BIN/x64/usb2406.dll",
 ]
 
-DEFAULT_DLL_PATH = SEARCH_DLL_PATHS[2]  # Default to SDK 64-bit DLL path
+DEFAULT_DLL_PATH = os.environ.get("USB2406_DLL_PATH", "USB2406.dll")
 
 
 def save_to_tdms(
@@ -719,7 +722,7 @@ def run_periodic_tdms(
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--card", type=int, default=0, help="USB card DIP ID (0-15)")
-    ap.add_argument("--dll-path", type=str, default=DEFAULT_DLL_PATH, help="Path to USB2406.dll")
+    ap.add_argument("--dll-path", type=str, default=DEFAULT_DLL_PATH, help="Path to USB2406.dll (default: USB2406_DLL_PATH or local driver search)")
     ap.add_argument("--channels", type=int, default=4, help="Number of channels to record (default: 4)")
     ap.add_argument("--fs", type=float, default=100.0, help="Sampling rate in kHz (default: 100.0)")
     ap.add_argument("--gain", type=int, default=0, help="Gain setting (0: ±10V, 1: ±1V, 2: ±100mV, 3: ±10mV)")
