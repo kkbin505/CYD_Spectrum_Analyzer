@@ -88,7 +88,8 @@ static volatile uint32_t stat_analysis_us = 0;
 
 static void analysisTask(void *) {
   for (;;) {
-    if (xQueueReceive(audio_queue, analysis_block, portMAX_DELAY) != pdTRUE) {
+    display::pollTouch();
+    if (xQueueReceive(audio_queue, analysis_block, pdMS_TO_TICKS(20)) != pdTRUE) {
       continue;
     }
     const int64_t t0 = esp_timer_get_time();

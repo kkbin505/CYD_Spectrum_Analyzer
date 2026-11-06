@@ -1,5 +1,7 @@
 #include "display.h"
+#include "peak_tracker.h"
 
+#include <Wire.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,17 +62,22 @@ class LGFX : public lgfx::LGFX_Device {
 
 LGFX tft;
 LGFX_Sprite plot(&tft);
+LGFX_Sprite curve(&tft);
+LGFX_Sprite sidebar(&tft);
 
 // Landscape: 320 x 240 after setRotation(1).
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 240;
 
-constexpr int kTopH = 32;
-constexpr int kPlotX = 40;
-constexpr int kPlotY = kTopH;
-constexpr int kPlotW = kScreenW - kPlotX - 4;  // 276
-constexpr int kPlotH = 186;  // fills down to the frequency labels at the bottom
-constexpr int kLabelY = kPlotY + kPlotH + 4;   // 200
+// Left column: readings/settings. Right: spectrum (about 1/4), then waterfall.
+constexpr int kSidebarW = 70;
+constexpr int kPlotX = kSidebarW + 22;
+constexpr int kPlotW = kScreenW - kPlotX - 4;
+constexpr int kLineY = 4;
+constexpr int kLineH = 50;
+constexpr int kPlotY = 64;
+constexpr int kPlotH = 154;
+constexpr int kLabelY = 224;
 
 // Logarithmic frequency axis, 20 Hz .. 20 kHz.
 constexpr float kFreqMin = 20.0f;
@@ -79,7 +86,7 @@ constexpr float kFreqMax = 20000.0f;
 // Line mode: dBA scale of the plot. Levels are relative until the microphone
 // is calibrated, so treat these as display limits rather than absolute SPL.
 constexpr float kDbMin = 20.0f;
-constexpr float kDbMax = 110.0f;
+constexpr float kDbMax = 80.0f;
 
 // Heat map mode: black at or below kHeatFloorDb, brightest colour at kHeatTopDb.
 // Change kHeatTopDb to rescale the colour range.
@@ -94,6 +101,7 @@ const uint16_t kLine = lgfx::color565(90, 200, 245);
 const uint16_t kGrey = lgfx::color565(140, 150, 160);
 const uint16_t kWhite = lgfx::color565(235, 240, 245);
 const uint16_t kGreen = lgfx::color565(80, 220, 120);
+const uint16_t kPeakRed = lgfx::color565(255, 64, 64);
 
 uint16_t gLoBin[kPlotW];
 uint16_t gHiBin[kPlotW];
@@ -102,11 +110,27 @@ bool gMapped = false;
 // Heat map: per-column maximum over all spectra in the current 0.5 s window.
 float gRowMax[kPlotW];
 
+// FT6336G shares the already initialised Wire bus with the ES8311.
+constexpr uint8_t kTouchAddr = 0x38;
+constexpr int kOrderX = (kSidebarW - 24) / 2;
+constexpr int kOrderUpY = 140;
+constexpr int kOrderDownY = 194;
+constexpr int kButtonSize = 24;
+uint16_t gOrder = 10;
+float gPeakHz = 0.0f;
+float gPeakDba = -INFINITY;
+PeakTracker gTracker;
+float gDba = 0.0f, gSpl = 0.0f, gPeak = 0.0f;
+bool gTouchDown = false;
+bool gTouchAvailable = false;
+bool gReady = false;
+const float *gLatestBins = nullptr;
+
 int yOf(float db) {
   float t = (kDbMax - db) / (kDbMax - kDbMin);
   if (t < 0.0f) t = 0.0f;
   if (t > 1.0f) t = 1.0f;
-  return static_cast<int>(t * (kPlotH - 1));
+  return static_cast<int>(t * (kLineH - 1));
 }
 
 int xOf(float freq) {
@@ -154,51 +178,59 @@ void drawFreqLabels() {
   }
 }
 
-void drawLineAxisLabels() {
-  tft.setFont(&lgfx::fonts::Font2);
+void drawAxes() {
+  tft.setFont(&lgfx::fonts::Font0);
   tft.setTextColor(kGrey, kBg);
-  for (int db = 30; db <= 110; db += 20) {
-    const int y = kPlotY + yOf(static_cast<float>(db));
-    tft.drawRightString(String(db), kPlotX - 4, y - 8);
+  for (int db = static_cast<int>(kDbMin); db <= static_cast<int>(kDbMax); db += 20) {
+    tft.drawRightString(String(db), kPlotX - 4,
+                        kLineY + yOf(static_cast<float>(db)) - 3);
   }
-  drawFreqLabels();
-}
-
-void drawHeatAxisLabels() {
-  // Rows are 0.5 s apart, so 2 rows per second; the top row is "now".
-  tft.setFont(&lgfx::fonts::Font2);
-  tft.setTextColor(kGrey, kBg);
-  const int rows_per_s = 1000 / kHeatRowMs;
-  for (int s = 0; s <= 80; s += 20) {
-    const int y = kPlotY + s * rows_per_s;
+  for (int seconds = 0; seconds <= 60; seconds += 20) {
     char buf[12];
-    snprintf(buf, sizeof(buf), s == 0 ? "0s" : "-%ds", s);
-    tft.drawRightString(buf, kPlotX - 4, s == 0 ? y : y - 8);
+    snprintf(buf, sizeof(buf), seconds ? "-%ds" : "0s", seconds);
+    tft.drawRightString(buf, kPlotX - 4, kPlotY + seconds * 2);
   }
+  tft.drawFastVLine(kSidebarW + 2, 0, kScreenH, kGrid);
+  tft.drawFastHLine(kPlotX, kPlotY - 5, kPlotW, kGrid);
   drawFreqLabels();
 }
 
-void drawTopBar(float dba, float spl, float peak) {
+void drawSidebar(float dba, float spl, float peak) {
   char buf[24];
-
-  tft.fillRect(0, 0, kScreenW, kTopH, kBg);
-
-  tft.setFont(&lgfx::fonts::Font2);
-  tft.setTextColor(kGrey, kBg);
-  tft.drawString("[dBA]", 4, 8);
-
-  tft.setFont(&lgfx::fonts::Font4);
-  tft.setTextColor(kWhite, kBg);
+  // Compose off-screen, then transfer the completed image without a blank phase.
+  sidebar.fillSprite(kBg);
+  sidebar.setFont(&lgfx::fonts::Font2);
+  sidebar.setTextColor(kGrey, kBg);
+  sidebar.drawString("dBA", 4, 2);
+  sidebar.setFont(&lgfx::fonts::Font4);
+  sidebar.setTextColor(kWhite, kBg);
   snprintf(buf, sizeof(buf), "%.1f", dba);
-  tft.drawString(buf, 50, 2);
+  sidebar.drawString(buf, 4, 20);
 
-  tft.setFont(&lgfx::fonts::Font2);
-  tft.setTextColor(kGrey, kBg);
+  sidebar.setFont(&lgfx::fonts::Font0);
+  sidebar.setTextColor(kGrey, kBg);
   snprintf(buf, sizeof(buf), "SPL %.1f", spl);
-  tft.drawRightString(buf, kScreenW - 78, 8);
-  tft.setTextColor(kGreen, kBg);
+  sidebar.drawString(buf, 4, 52);
   snprintf(buf, sizeof(buf), "pk %.1f", peak);
-  tft.drawRightString(buf, kScreenW - 4, 8);
+  sidebar.drawString(buf, 4, 73);
+
+  sidebar.setTextColor(kGrey, kBg);
+
+  sidebar.setFont(&lgfx::fonts::Font2);
+  sidebar.drawCenterString("Order", kSidebarW / 2, 116);
+  sidebar.drawRoundRect(kOrderX, kOrderUpY, kButtonSize, kButtonSize, 4, kGrey);
+  sidebar.drawRoundRect(kOrderX, kOrderDownY, kButtonSize, kButtonSize, 4, kGrey);
+  const int cx = kSidebarW / 2;
+  sidebar.fillTriangle(cx, kOrderUpY + 5,
+                       cx - 7, kOrderUpY + 17,
+                       cx + 7, kOrderUpY + 17, gOrder < UINT16_MAX ? kWhite : kGrid);
+  sidebar.fillTriangle(cx, kOrderDownY + 19,
+                       cx - 7, kOrderDownY + 7,
+                       cx + 7, kOrderDownY + 7, gOrder > 1 ? kWhite : kGrid);
+  sidebar.setTextColor(kWhite, kBg);
+  snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(gOrder));
+  sidebar.drawCenterString(buf, cx, 171);
+  sidebar.pushSprite(0, 0);
 }
 
 void buildMapping(float bin_hz, uint16_t bin_count) {
@@ -212,6 +244,7 @@ void buildMapping(float bin_hz, uint16_t bin_count) {
     int lo = static_cast<int>(ceilf(f_lo / bin_hz));
     int hi = static_cast<int>(floorf(f_hi / bin_hz));
     if (lo < 1) lo = 1;  // skip DC
+    if (lo > last_bin) lo = last_bin;
     if (hi > last_bin) hi = last_bin;
     if (hi < lo) hi = lo;
     gLoBin[x] = static_cast<uint16_t>(lo);
@@ -230,27 +263,56 @@ float columnLevel(const float *dba_bins, int x) {
 }
 
 void drawLineCurve(const float *dba_bins) {
-  plot.fillSprite(kBg);
-
-  for (int db = 30; db <= 110; db += 20) {
-    plot.drawFastHLine(0, yOf(static_cast<float>(db)), kPlotW, kGrid);
+  curve.fillSprite(kBg);
+  int ys[kPlotW];
+  for (int x = 0; x < kPlotW; ++x) {
+    ys[x] = yOf(columnLevel(dba_bins, x));
+  }
+  // Dark blue area, fading toward the baseline like a spectrum analyser.
+  // Fill before drawing the grid and trace so both remain visible.
+  for (int y = 0; y < kLineH; ++y) {
+    const float brightness = 1.0f - static_cast<float>(y) / (kLineH - 1);
+    const uint16_t color = lgfx::color565(3, 8 + 22 * brightness,
+                                          28 + 65 * brightness);
+    for (int x = 0; x < kPlotW; ++x) {
+      if (y >= ys[x]) curve.drawPixel(x, y, color);
+    }
+  }
+  for (int db = static_cast<int>(kDbMin); db <= static_cast<int>(kDbMax); db += 20) {
+    curve.drawFastHLine(0, yOf(static_cast<float>(db)), kPlotW, kGrid);
   }
   const float grid_hz[] = {100.0f, 1000.0f, 10000.0f};
   for (float f : grid_hz) {
-    const int x = xOf(f) - kPlotX;
-    plot.drawFastVLine(x, 0, kPlotH, kGrid);
+    curve.drawFastVLine(xOf(f) - kPlotX, 0, kLineH, kGrid);
   }
-
-  int prev_y = -1;
   for (int x = 0; x < kPlotW; ++x) {
-    const int y = yOf(columnLevel(dba_bins, x));
-    if (prev_y >= 0) {
-      plot.drawLine(x - 1, prev_y, x, y, kLine);
-    } else {
-      plot.drawPixel(x, y, kLine);
-    }
-    prev_y = y;
+    if (x > 0) curve.drawLine(x - 1, ys[x - 1], x, ys[x], kLine);
+    else curve.drawPixel(x, ys[x], kLine);
   }
+  if (gPeakHz > 0.0f && isfinite(gPeakDba)) {
+    const int peak_x = xOf(gPeakHz) - kPlotX;
+    const int peak_y = yOf(gPeakDba);
+    curve.drawFastVLine(peak_x, 0, kLineH, kPeakRed);
+    curve.fillCircle(peak_x, peak_y, 2, kPeakRed);
+
+  }
+  char label[48];
+  if (gTracker.valid) {
+    snprintf(label, sizeof(label), "%.0fdBA @ %.0fHz %.0fRPM",
+             gPeakDba, gPeakHz, gPeakHz * 60.0f / gOrder);
+  } else {
+    snprintf(label, sizeof(label), "--dBA @ --Hz --RPM");
+  }
+  curve.setFont(&lgfx::fonts::Font0);
+  curve.setTextSize(1.0f);
+  constexpr int label_x = 4;
+  constexpr int label_y = 5 - kLineY;
+  curve.fillRect(label_x - 2, label_y, curve.textWidth(label) + 4,
+                 curve.fontHeight() + 2, kBg);
+  curve.setTextColor(kWhite, kBg);
+  curve.drawString(label, label_x, label_y);
+  // Fill, marker and text share one off-screen frame, avoiding erase flicker.
+  curve.pushSprite(kPlotX, kLineY);
 }
 
 // Heat map: shift the whole sprite down one row (raw byte move, sprite is
@@ -275,6 +337,15 @@ void begin() {
   tft.setBrightness(255);
   tft.fillScreen(kBg);
 
+  pinMode(18, OUTPUT);  // FT6336G reset; does not reset the audio codec
+  digitalWrite(18, LOW);
+  delay(10);
+  digitalWrite(18, HIGH);
+  delay(100);
+  Wire.beginTransmission(kTouchAddr);
+  gTouchAvailable = Wire.endTransmission() == 0;
+  if (!gTouchAvailable) Serial.println("# FT6336G touch not found at 0x38");
+
   plot.setColorDepth(16);
   plot.setPsram(true);
   if (plot.createSprite(kPlotW, kPlotH) == nullptr) {
@@ -286,18 +357,83 @@ void begin() {
       return;
     }
   }
-  plot.fillSprite(kHeatmapMode ? kBlack : kBg);
-
-  if (kHeatmapMode) {
-    drawHeatAxisLabels();
-  } else {
-    drawLineAxisLabels();
+  curve.setColorDepth(16);
+  curve.setPsram(true);
+  if (curve.createSprite(kPlotW, kLineH) == nullptr) {
+    curve.setPsram(false);
+    if (curve.createSprite(kPlotW, kLineH) == nullptr) {
+      tft.setFont(&lgfx::fonts::Font2);
+      tft.setTextColor(kWhite, kBg);
+      tft.drawString("spectrum buffer alloc failed", 8, 40);
+      return;
+    }
   }
-  drawTopBar(0.0f, 0.0f, 0.0f);
+  sidebar.setColorDepth(16);
+  sidebar.setPsram(true);
+  if (sidebar.createSprite(kSidebarW, kScreenH) == nullptr) {
+    sidebar.setPsram(false);
+    if (sidebar.createSprite(kSidebarW, kScreenH) == nullptr) {
+      tft.setFont(&lgfx::fonts::Font2);
+      tft.setTextColor(kWhite, kBg);
+      tft.drawString("sidebar buffer alloc failed", 8, 40);
+      return;
+    }
+  }
+  plot.fillSprite(kBlack);
+  plot.pushSprite(kPlotX, kPlotY);
+  curve.fillSprite(kBg);
+  curve.pushSprite(kPlotX, kLineY);
+  drawAxes();
+  drawSidebar(0.0f, 0.0f, 0.0f);
+  gReady = true;
+}
+
+void pollTouch() {
+  if (!gReady) return;
+  if (gTracker.expire(millis())) {
+    gPeakHz = gTracker.hz;
+    gPeakDba = gTracker.dba;
+    if (gLatestBins != nullptr) drawLineCurve(gLatestBins);
+  }
+  if (!gTouchAvailable) return;
+  Wire.beginTransmission(kTouchAddr);
+  Wire.write(static_cast<uint8_t>(0x02));
+  if (Wire.endTransmission(false) != 0) return;
+  if (Wire.requestFrom(static_cast<uint8_t>(kTouchAddr), static_cast<uint8_t>(5)) != 5) return;
+  uint8_t b[5];
+  for (auto &v : b) v = Wire.read();
+  const bool down = (b[0] & 0x0f) != 0;
+  const bool pressed = down && !gTouchDown;
+  gTouchDown = down;  // One step per press; holding or dragging does not repeat.
+  if (!pressed || (b[0] & 0x0f) != 1) return;
+  const int raw_x = ((b[1] & 0x0f) << 8) | b[2];
+  const int raw_y = ((b[3] & 0x0f) << 8) | b[4];
+  if (raw_x >= 240 || raw_y >= 320) return;
+  // Rotation 3 plus the board's 180-degree touch offset (same as badge firmware).
+  const int x = raw_y;
+  const int y = 239 - raw_x;
+  if (x < kOrderX || x >= kOrderX + kButtonSize) return;
+  if (y >= kOrderUpY && y < kOrderUpY + kButtonSize && gOrder < UINT16_MAX) {
+    ++gOrder;
+  } else if (y >= kOrderDownY && y < kOrderDownY + kButtonSize && gOrder > 1) {
+    --gOrder;
+  } else {
+    return;
+  }
+  drawSidebar(gDba, gSpl, gPeak);
+  if (gLatestBins != nullptr) drawLineCurve(gLatestBins);
 }
 
 void update(const float *dba_bins, uint16_t bin_count, float bin_hz,
             float dba, float spl, float peak) {
+  if (!gReady || dba_bins == nullptr || bin_count < 2 || !isfinite(bin_hz) || bin_hz <= 0.0f) return;
+  gLatestBins = dba_bins;
+  gDba = dba;
+  gSpl = spl;
+  gPeak = peak;
+  gTracker.update(dba_bins, bin_count, bin_hz, millis());
+  gPeakHz = gTracker.hz;
+  gPeakDba = gTracker.dba;
   if (!gMapped) {
     if (bin_hz <= 0.0f) return;
     buildMapping(bin_hz, bin_count);
@@ -306,27 +442,22 @@ void update(const float *dba_bins, uint16_t bin_count, float bin_hz,
 
   const uint32_t now = millis();
 
-  if (kHeatmapMode) {
-    // Fold this spectrum into the current window's per-column maximum.
-    for (int x = 0; x < kPlotW; ++x) {
-      const float v = columnLevel(dba_bins, x);
-      if (v > gRowMax[x]) gRowMax[x] = v;
-    }
-
-    static uint32_t last_row = 0;
-    if (now - last_row >= kHeatRowMs) {
-      pushHeatRow(gRowMax);
-      for (int x = 0; x < kPlotW; ++x) gRowMax[x] = -200.0f;
-      last_row = now;
-    }
-  } else {
-    drawLineCurve(dba_bins);
-    plot.pushSprite(kPlotX, kPlotY);
+  // Both plots use exactly the same column-to-bin mapping and horizontal extent.
+  drawLineCurve(dba_bins);
+  for (int x = 0; x < kPlotW; ++x) {
+    const float v = columnLevel(dba_bins, x);
+    if (v > gRowMax[x]) gRowMax[x] = v;
+  }
+  static uint32_t last_row = 0;
+  if (now - last_row >= kHeatRowMs) {
+    pushHeatRow(gRowMax);
+    for (int x = 0; x < kPlotW; ++x) gRowMax[x] = -200.0f;
+    last_row = now;
   }
 
   static uint32_t last_text = 0;
   if (now - last_text >= 200) {
-    drawTopBar(dba, spl, peak);
+    drawSidebar(dba, spl, peak);
     last_text = now;
   }
 }
