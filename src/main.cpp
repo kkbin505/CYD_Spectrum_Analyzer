@@ -67,15 +67,21 @@ constexpr uint16_t FRAME_VERSION = 3;
 constexpr uint16_t FRAME_HEADER_SIZE = 32;
 constexpr float MIC_FULL_SCALE = 8388608.0f; // 2^23
 
-// Streaming every frame over native USB CDC paces the capture loop: one 6 KB
-// frame takes ~64 ms to drain, which is longer than the 46 ms it takes to
-// record it. Keep it off while the on-screen meter runs; turn it on for bench
-// captures with python/ad9833_stream.py.
-constexpr bool USB_STREAM_ENABLE = false;
-
+// USB streaming is off until the host sends 'S' (see pollUsbCommands). While it
+// is off the capture loop does no extra work and the on-screen meter is unchanged.
+static volatile bool usb_stream_active = false;
 static uint32_t frame_seq = 0;
 static int32_t sample_buffer[SAMPLES_PER_FRAME];
-static uint8_t payload[SAMPLES_PER_FRAME * 3];
+
+// Frames are built in fixed slots and sent by a separate USB TX task, so a slow
+// host never blocks I2S capture. If no slot is free the block is dropped; the
+// sequence-number gap tells the host.
+constexpr size_t TX_FRAME_BYTES = FRAME_HEADER_SIZE + SAMPLES_PER_FRAME * 3;
+constexpr uint8_t TX_SLOTS = 4;
+static uint8_t tx_slots[TX_SLOTS][TX_FRAME_BYTES];
+static QueueHandle_t tx_free_queue = nullptr; // slot indices available to fill
+static QueueHandle_t tx_full_queue = nullptr; // slot indices ready to send
+static volatile uint32_t stat_frames_dropped = 0;
 
 // Capture runs on the Arduino core-1 task so I2S is never starved; the FFT and
 // display run on core 0. A one-deep queue means the analyser always works on
@@ -111,8 +117,11 @@ static void packInt24LE(uint8_t *dst, int32_t sample) {
   dst[2] = static_cast<uint8_t>((sample >> 16) & 0xFF);
 }
 
-static void sendFrame24(const uint8_t *packed_samples, uint16_t n_samples) {
-  uint8_t header[FRAME_HEADER_SIZE];
+// Fills dst (TX_FRAME_BYTES long) with one header plus the packed 24-bit payload.
+static void buildFrame(uint8_t *dst, uint32_t seq, const int32_t *samples,
+                       uint16_t n_samples) {
+  uint8_t *header = dst;
+  uint8_t *out = dst + FRAME_HEADER_SIZE;
   uint32_t ts = static_cast<uint32_t>(esp_timer_get_time());
 
   header[0] = FRAME_MAGIC & 0xFF;
@@ -122,7 +131,6 @@ static void sendFrame24(const uint8_t *packed_samples, uint16_t n_samples) {
   header[4] = FRAME_VERSION & 0xFF;
   header[5] = (FRAME_VERSION >> 8) & 0xFF;
 
-  uint32_t seq = frame_seq++;
   memcpy(&header[6], &seq, sizeof(seq));
 
   uint32_t fs = SAMPLE_RATE_HZ;
@@ -139,9 +147,75 @@ static void sendFrame24(const uint8_t *packed_samples, uint16_t n_samples) {
   uint32_t payload_bytes = n_samples * CHANNELS * 3;
   memcpy(&header[28], &payload_bytes, sizeof(payload_bytes));
 
-  Serial.write(header, FRAME_HEADER_SIZE);
-  Serial.write(packed_samples, payload_bytes);
-  Serial.flush();
+  for (uint16_t i = 0; i < n_samples; i++) {
+    // The codec sends 24-bit samples left-justified in a 32-bit I2S slot.
+    packInt24LE(&out[i * 3], samples[i] >> 8);
+  }
+}
+
+// Writes n bytes to the USB CDC port. Gives up after 200 ms so a host that has
+// stopped reading cannot wedge the TX task. A partial frame is resynchronised
+// by the host on the next magic word.
+static bool writeAll(const uint8_t *p, size_t n) {
+  size_t off = 0;
+  const int64_t deadline = esp_timer_get_time() + 200000;
+  while (off < n) {
+    if (esp_timer_get_time() > deadline) {
+      return false;
+    }
+    const int avail = Serial.availableForWrite();
+    if (avail <= 0) {
+      vTaskDelay(1);
+      continue;
+    }
+    size_t chunk = static_cast<size_t>(avail);
+    if (chunk > n - off) {
+      chunk = n - off;
+    }
+    off += Serial.write(p + off, chunk);
+  }
+  return true;
+}
+
+// Host protocol (one ASCII byte each, read whenever available):
+//   'S'  start binary frame stream
+//   'P'  stop binary frame stream
+//   'I'  print a '#' info line (only while the stream is stopped)
+static void pollUsbCommands() {
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+    if (c == 'S') {
+      usb_stream_active = true;
+    } else if (c == 'P') {
+      usb_stream_active = false;
+    } else if (c == 'I' && !usb_stream_active) {
+      Serial.printf("# info fs=%u frame=%u channels=%u fullscale=%.0f version=%u\n",
+                    SAMPLE_RATE_HZ, SAMPLES_PER_FRAME, CHANNELS, MIC_FULL_SCALE,
+                    FRAME_VERSION);
+    }
+  }
+}
+
+static void usbTxTask(void *) {
+  uint8_t slot;
+  for (;;) {
+    pollUsbCommands();
+    if (!usb_stream_active) {
+      // Recycle any frames left over from the previous session.
+      while (xQueueReceive(tx_full_queue, &slot, 0) == pdTRUE) {
+        xQueueSend(tx_free_queue, &slot, 0);
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    if (xQueueReceive(tx_full_queue, &slot, pdMS_TO_TICKS(10)) != pdTRUE) {
+      continue;
+    }
+    if (!writeAll(tx_slots[slot], TX_FRAME_BYTES)) {
+      stat_frames_dropped++;
+    }
+    xQueueSend(tx_free_queue, &slot, 0);
+  }
 }
 
 static bool es8311Write(uint8_t reg, uint8_t val) {
@@ -259,13 +333,17 @@ static bool captureFrame() {
     return false;
   }
 
-  if (USB_STREAM_ENABLE) {
-    for (uint16_t i = 0; i < SAMPLES_PER_FRAME; i++) {
-      // The codec sends 24-bit samples left-justified in a 32-bit I2S slot.
-      int32_t sample24 = sample_buffer[i] >> 8;
-      packInt24LE(&payload[i * 3], sample24);
+  if (usb_stream_active) {
+    // The sequence number advances for every captured block, so a dropped
+    // block shows up as a gap on the host.
+    const uint32_t seq = frame_seq++;
+    uint8_t slot;
+    if (xQueueReceive(tx_free_queue, &slot, 0) == pdTRUE) {
+      buildFrame(tx_slots[slot], seq, sample_buffer, SAMPLES_PER_FRAME);
+      xQueueSend(tx_full_queue, &slot, 0);
+    } else {
+      stat_frames_dropped++;
     }
-    sendFrame24(payload, SAMPLES_PER_FRAME);
   }
   return true;
 }
@@ -309,6 +387,18 @@ void setup() {
       delay(1000);
     }
   }
+  tx_free_queue = xQueueCreate(TX_SLOTS, sizeof(uint8_t));
+  tx_full_queue = xQueueCreate(TX_SLOTS, sizeof(uint8_t));
+  if (tx_free_queue == nullptr || tx_full_queue == nullptr) {
+    Serial.println("# fatal: could not create USB TX queues");
+    while (true) {
+      delay(1000);
+    }
+  }
+  for (uint8_t i = 0; i < TX_SLOTS; i++) {
+    xQueueSend(tx_free_queue, &i, 0);
+  }
+  xTaskCreatePinnedToCore(usbTxTask, "usb_tx", 4096, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(analysisTask, "analysis", 8192, nullptr, 1, nullptr, 0);
 
   Serial.println("# display ready");
@@ -334,10 +424,13 @@ void loop() {
   const uint32_t now = millis();
   if (now - last_report >= 5000) {
     const float fps = frames * 1000.0f / (now - last_report);
-    Serial.printf("# fps=%.1f capture=%.1fms analysis=%.1fms dba=%.1f spl=%.1f\n",
-                  fps, cap_us / 1000.0f / frames,
-                  stat_analysis_us / 1000.0f, spectrum::dba(),
-                  spectrum::spl());
+    // Text logs would corrupt the binary stream, so stay quiet while it runs.
+    if (!usb_stream_active) {
+      Serial.printf("# fps=%.1f capture=%.1fms analysis=%.1fms dba=%.1f spl=%.1f dropped=%lu\n",
+                    fps, cap_us / 1000.0f / frames,
+                    stat_analysis_us / 1000.0f, spectrum::dba(),
+                    spectrum::spl(), static_cast<unsigned long>(stat_frames_dropped));
+    }
     frames = 0;
     cap_us = 0;
     last_report = now;
